@@ -1,0 +1,1088 @@
+# Discord Bot: shahar Toueg
+
+```javascript
+// === INSTALLATION INSTRUCTIONS ===
+// 1. Create a new folder and run: npm init -y
+// 2. Install required packages:
+//    npm install discord.js @discordjs/voice dotenv node-cron fs-extra
+// 3. Create a .env file with DISCORD_TOKEN=your_bot_token_here
+// 4. Run with: node bot.js
+
+// === .env.example ===
+// DISCORD_TOKEN=your_bot_token_here
+// CLIENT_ID=your_application_id_here
+// GUILD_ID=your_guild_id_here (optional, for guild-specific commands)
+
+const { Client, Collection, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField } = require('discord.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection } = require('@discordjs/voice');
+const cron = require('node-cron');
+const fs = require('fs-extra');
+const path = require('path');
+
+// Environment variables
+require('dotenv').config();
+
+// Initialize client
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildPresences, // Required for online alerts
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: [Partials.Channel, Partials.Message, Partials.User, Partials.GuildMember, Partials.Reaction],
+});
+
+// Collections
+client.commands = new Collection();
+client.cooldowns = new Collection();
+client.queues = new Collection();
+client.alerts = new Collection();
+client.xp = new Collection(); // For XP system
+client.reactionRoles = new Collection();
+
+// Load commands
+const commandFolders = fs.readdirSync('./commands');
+for (const folder of commandFolders) {
+  const commandFiles = fs.readdirSync(`./commands/${folder}`).filter(file => file.endsWith('.js'));
+  for (const file of commandFiles) {
+    const command = require(`./commands/${folder}/${file}`);
+    client.commands.set(command.data.name, command);
+  }
+}
+
+// Load events
+const eventFiles = fs.readdirSync('./events').filter(file => file.endsWith('.js'));
+for (const file of eventFiles) {
+  const event = require(`./events/${file}`);
+  if (event.once) {
+    client.once(event.name, (...args) => event.execute(...args, client));
+  } else {
+    client.on(event.name, (...args) => event.execute(...args, client));
+  }
+}
+
+// Load alerts from file on startup
+async function loadAlerts() {
+  try {
+    const alertsPath = path.join(__dirname, 'alerts.json');
+    if (await fs.pathExists(alertsPath)) {
+      const data = await fs.readJson(alertsPath);
+      for (const [id, alert] of Object.entries(data)) {
+        client.alerts.set(id, alert);
+      }
+      console.log(`Loaded ${client.alerts.size} alerts`);
+    } else {
+      await fs.writeJson(alertsPath, {});
+      console.log('Created alerts.json');
+    }
+  } catch (error) {
+    console.error('Error loading alerts:', error);
+  }
+}
+
+// Save alerts to file
+async function saveAlerts() {
+  try {
+    const alertsPath = path.join(__dirname, 'alerts.json');
+    const data = {};
+    client.alerts.forEach((alert, id) => {
+      data[id] = alert;
+    });
+    await fs.writeJson(alertsPath, data, { spaces: 2 });
+  } catch (error) {
+    console.error('Error saving alerts:', error);
+  }
+}
+
+// Start alert monitors
+function startAlertMonitors() {
+  // Milestone alerts - handled in memberAdd/remove events
+  // Online alerts - handled in presenceUpdate event
+  // Schedule alerts - use cron
+  client.alerts.forEach((alert, id) => {
+    if (alert.type === 'schedule') {
+      try {
+        cron.schedule(alert.cron, async () => {
+          try {
+            await executeAlert(id, alert);
+          } catch (error) {
+            console.error(`Error executing scheduled alert ${id}:`, error);
+          }
+        });
+      } catch (error) {
+        console.error(`Invalid cron expression for alert ${id}:`, alert.cron);
+      }
+    }
+  });
+}
+
+// Execute an alert
+async function executeAlert(id, alert) {
+  try {
+    switch (alert.type) {
+      case 'announce':
+        if (alert.channelId) {
+          const channel = await client.channels.fetch(alert.channelId);
+          if (channel?.isTextBased()) {
+            await channel.send({ content: alert.message });
+          }
+        }
+        break;
+      case 'milestone':
+        if (alert.guildId) {
+          const guild = await client.guilds.fetch(alert.guildId);
+          if (guild.memberCount >= alert.count) {
+            if (alert.channelId) {
+              const channel = await client.channels.fetch(alert.channelId);
+              if (channel?.isTextBased()) {
+                await channel.send({ content: alert.message });
+              }
+            }
+          }
+        }
+        break;
+      case 'online':
+        if (alert.userId && alert.channelId) {
+          const user = await client.users.fetch(alert.userId);
+          const guild = await client.guilds.fetch(alert.guildId);
+          const member = await guild.members.fetch(user.id);
+          if (member.presence?.status === 'online' || member.presence?.status === 'idle' || member.presence?.status === 'dnd') {
+            const channel = await client.channels.fetch(alert.channelId);
+            if (channel?.isTextBased()) {
+              await channel.send({ content: alert.message.replace('{user}', `<@${user.id}>`) });
+            }
+          }
+        }
+        break;
+      case 'schedule':
+        if (alert.channelId) {
+          const channel = await client.channels.fetch(alert.channelId);
+          if (channel?.isTextBased()) {
+            await channel.send({ content: alert.message });
+          }
+        }
+        break;
+      default:
+        console.warn(`Unknown alert type: ${alert.type}`);
+    }
+  } catch (error) {
+    console.error(`Error executing alert ${id}:`, error);
+  }
+}
+
+// Initialize bot
+client.once('ready', async () => {
+  console.log(`✅ ${client.user.tag} is online!`);
+  console.log(`📊 Serving ${client.guilds.cache.size} servers`);
+  
+  // Set activity
+  client.user.setActivity('shahar Toueg | /help', { type: 3 });
+  
+  // Load alerts
+  await loadAlerts();
+  
+  // Start alert monitors
+  startAlertMonitors();
+  
+  // Register slash commands
+  const commands = [];
+  client.commands.forEach(command => {
+    commands.push(command.data.toJSON());
+  });
+
+  // Global commands (for all servers)
+  await client.application.commands.set(commands);
+  console.log(`✅ Registered ${commands.length} slash commands globally`);
+});
+
+// Handle interactions
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const command = client.commands.get(interaction.commandName);
+  if (!command) {
+    console.error(`No command matching ${interaction.commandName} was found.`);
+    return;
+  }
+
+  // Cooldown handling
+  const { cooldowns } = client;
+  const now = Date.now();
+  const timestamps = cooldowns.get(interaction.commandName) || new Map();
+  const defaultCooldownDuration = 3000;
+  const cooldownAmount = (command.cooldown || defaultCooldownDuration);
+
+  if (timestamps.has(interaction.user.id)) {
+    const expirationTime = timestamps.get(interaction.user.id) + cooldownAmount;
+    if (now < expirationTime) {
+      const timeLeft = (expirationTime - now) / 1000;
+      return interaction.reply({ 
+        content: `⏱️ Please wait ${timeLeft.toFixed(1)} seconds before using \`${interaction.commandName}\` again.`, 
+        ephemeral: true 
+      });
+    }
+  }
+
+  timestamps.set(interaction.user.id, now);
+  cooldowns.set(interaction.commandName, timestamps);
+  setTimeout(() => timestamps.delete(interaction.user.id), cooldownAmount);
+
+  try {
+    await command.execute(interaction, client);
+  } catch (error) {
+    console.error(`Error executing ${interaction.commandName}:`, error);
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ 
+        content: '❌ There was an error while executing this command!', 
+        ephemeral: true 
+      });
+    } else {
+      await interaction.reply({ 
+        content: '❌ There was an error while executing this command!', 
+        ephemeral: true 
+      });
+    }
+  }
+});
+
+// Login
+client.login(process.env.DISCORD_TOKEN).catch(console.error);
+```
+
+```javascript
+// ./events/ready.js
+module.exports = {
+  name: 'ready',
+  once: true,
+  execute(client) {
+    console.log(`✅ ${client.user.tag} is ready!`);
+  }
+};
+```
+
+```javascript
+// ./events/messageCreate.js
+const { EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  name: 'messageCreate',
+  async execute(message, client) {
+    // Ignore bots
+    if (message.author.bot) return;
+
+    // Bad word filter
+    const badWords = ['badword1', 'badword2']; // Replace with your list
+    const messageContent = message.content.toLowerCase();
+    
+    for (const word of badWords) {
+      if (messageContent.includes(word)) {
+        try {
+          await message.delete();
+          await message.author.send(`⚠️ Your message contained inappropriate language and was removed.`);
+        } catch (e) {
+          // If can't DM user, send in channel
+          await message.channel.send(`${message.author}, your message contained inappropriate language and was removed.`);
+        }
+        return;
+      }
+    }
+
+    // XP System
+    if (message.channel.type !== 1) { // Not DM
+      const userId = message.author.id;
+      const guildId = message.guild.id;
+      const key = `${guildId}-${userId}`;
+      
+      // Initialize XP if not exists
+      if (!client.xp.has(key)) {
+        client.xp.set(key, { xp: 0, level: 1, lastMessage: 0 });
+      }
+      
+      const userData = client.xp.get(key);
+      const now = Date.now();
+      
+      // Prevent spamming XP
+      if (now - userData.lastMessage < 60000) return;
+      
+      // Add XP (5-15 points per message)
+      const xpGain = Math.floor(Math.random() * 11) + 5;
+      userData.xp += xpGain;
+      userData.lastMessage = now;
+      
+      // Level up calculation
+      const xpNeeded = Math.floor(Math.pow(userData.level, 2) * 100);
+      if (userData.xp >= xpNeeded) {
+        userData.level++;
+        userData.xp = 0;
+        
+        // Level up announcement
+        const levelUpEmbed = new EmbedBuilder()
+          .setColor('#00ff00')
+          .setTitle('🎉 Level Up!')
+          .setDescription(`${message.author} has leveled up to level ${userData.level}!`)
+          .setThumbnail(message.author.displayAvatarURL());
+        
+        // Send in leveling channel if configured
+        const levelingChannel = message.guild.channels.cache.find(ch => ch.name === 'leveling');
+        if (levelingChannel && levelingChannel.isTextBased()) {
+          levelingChannel.send({ embeds: [levelUpEmbed] });
+        } else {
+          message.channel.send({ embeds: [levelUpEmbed] });
+        }
+      }
+      
+      client.xp.set(key, userData);
+    }
+  }
+};
+```
+
+```javascript
+// ./events/guildMemberAdd.js
+const { EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  name: 'guildMemberAdd',
+  async execute(member, client) {
+    const guild = member.guild;
+    
+    // Welcome message
+    const welcomeChannel = guild.channels.cache.find(ch => ch.name === 'welcome');
+    if (welcomeChannel && welcomeChannel.isTextBased()) {
+      const welcomeEmbed = new EmbedBuilder()
+        .setColor('#00ff00')
+        .setTitle('👋 Welcome!')
+        .setDescription(`Welcome to ${guild.name}, ${member}!`)
+        .setThumbnail(member.displayAvatarURL())
+        .addFields(
+          { name: 'Rules', value: 'Please read the rules in <#rules-channel-id>' },
+          { name: 'Get Started', value: 'Type `/help` to see available commands!' }
+        )
+        .setTimestamp();
+      
+      await welcomeChannel.send({ embeds: [welcomeEmbed] });
+    }
+    
+    // Auto-role
+    const autoRole = guild.roles.cache.find(role => role.name === 'Member');
+    if (autoRole) {
+      try {
+        await member.roles.add(autoRole);
+      } catch (error) {
+        console.error('Error adding auto-role:', error);
+      }
+    }
+    
+    // Check milestone alerts
+    client.alerts.forEach((alert, id) => {
+      if (alert.type === 'milestone' && alert.guildId === guild.id) {
+        if (guild.memberCount >= alert.count) {
+          // Execute milestone alert
+          executeMilestoneAlert(id, alert, client);
+        }
+      }
+    });
+  }
+};
+
+async function executeMilestoneAlert(id, alert, client) {
+  try {
+    const guild = await client.guilds.fetch(alert.guildId);
+    const channel = await client.channels.fetch(alert.channelId);
+    if (channel?.isTextBased()) {
+      await channel.send({ content: alert.message });
+      // Remove alert after execution
+      client.alerts.delete(id);
+      await saveAlerts(client);
+    }
+  } catch (error) {
+    console.error(`Error executing milestone alert ${id}:`, error);
+  }
+}
+```
+
+```javascript
+// ./events/guildMemberRemove.js
+const { EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  name: 'guildMemberRemove',
+  async execute(member, client) {
+    const guild = member.guild;
+    
+    // Leave announcement
+    const leaveChannel = guild.channels.cache.find(ch => ch.name === 'welcome');
+    if (leaveChannel && leaveChannel.isTextBased()) {
+      const leaveEmbed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('👋 Goodbye!')
+        .setDescription(`${member.user.username} has left ${guild.name}.`)
+        .setThumbnail(member.user.displayAvatarURL())
+        .setTimestamp();
+      
+      await leaveChannel.send({ embeds: [leaveEmbed] });
+    }
+    
+    // Check milestone alerts
+    client.alerts.forEach((alert, id) => {
+      if (alert.type === 'milestone' && alert.guildId === guild.id) {
+        if (guild.memberCount < alert.count) {
+          // Reset milestone if count drops below target
+          // (Optional: you might want to keep it active)
+        }
+      }
+    });
+  }
+};
+```
+
+```javascript
+// ./events/messageDelete.js
+const { EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  name: 'messageDelete',
+  async execute(message, client) {
+    if (!message.guild || message.author.bot) return;
+    
+    // Log deleted message
+    const logChannel = message.guild.channels.cache.find(ch => ch.name === 'mod-logs');
+    if (logChannel && logChannel.isTextBased()) {
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('🗑️ Message Deleted')
+        .addFields(
+          { name: 'Author', value: message.author.tag, inline: true },
+          { name: 'Channel', value: message.channel.toString(), inline: true },
+          { name: 'Content', value: message.content.length > 1024 ? message.content.substring(0, 1021) + '...' : message.content || 'No content' }
+        )
+        .setTimestamp();
+      
+      await logChannel.send({ embeds: [embed] });
+    }
+  }
+};
+```
+
+```javascript
+// ./events/messageUpdate.js
+const { EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  name: 'messageUpdate',
+  async execute(oldMessage, newMessage, client) {
+    if (!oldMessage.guild || oldMessage.author.bot || oldMessage.content === newMessage.content) return;
+    
+    // Log edited message
+    const logChannel = oldMessage.guild.channels.cache.find(ch => ch.name === 'mod-logs');
+    if (logChannel && logChannel.isTextBased()) {
+      const embed = new EmbedBuilder()
+        .setColor('#ffff00')
+        .setTitle('✏️ Message Edited')
+        .addFields(
+          { name: 'Author', value: oldMessage.author.tag, inline: true },
+          { name: 'Channel', value: oldMessage.channel.toString(), inline: true },
+          { name: 'Before', value: oldMessage.content.length > 1024 ? oldMessage.content.substring(0, 1021) + '...' : oldMessage.content || 'No content' },
+          { name: 'After', value: newMessage.content.length > 1024 ? newMessage.content.substring(0, 1021) + '...' : newMessage.content || 'No content' }
+        )
+        .setTimestamp();
+      
+      await logChannel.send({ embeds: [embed] });
+    }
+  }
+};
+```
+
+```javascript
+// ./events/voiceStateUpdate.js
+const { joinVoiceChannel, getVoiceConnection } = require('@discordjs/voice');
+
+module.exports = {
+  name: 'voiceStateUpdate',
+  async execute(oldState, newState, client) {
+    // Handle voice state changes for music queue management
+    if (oldState.channelId && !newState.channelId) {
+      // User left voice channel
+      const connection = getVoiceConnection(oldState.guild.id);
+      if (connection && connection.state.status === 'ready') {
+        const queue = client.queues.get(oldState.guild.id);
+        if (queue && queue.length === 0) {
+          // Disconnect after timeout
+          setTimeout(() => {
+            const connection = getVoiceConnection(oldState.guild.id);
+            if (connection && connection.state.status === 'ready') {
+              connection.destroy();
+              client.queues.delete(oldState.guild.id);
+            }
+          }, 300000); // 5 minutes
+        }
+      }
+    }
+  }
+};
+```
+
+```javascript
+// ./events/presenceUpdate.js
+module.exports = {
+  name: 'presenceUpdate',
+  async execute(oldPresence, newPresence, client) {
+    if (!newPresence || !newPresence.guild || !newPresence.member) return;
+    
+    // Check online alerts
+    client.alerts.forEach((alert, id) => {
+      if (alert.type === 'online' && alert.userId === newPresence.userId && alert.guildId === newPresence.guild.id) {
+        // Check if user came online
+        if (oldPresence?.status !== 'online' && newPresence.status === 'online') {
+          executeAlert(id, alert, client);
+        }
+      }
+    });
+  }
+};
+
+async function executeAlert(id, alert, client) {
+  try {
+    const channel = await client.channels.fetch(alert.channelId);
+    if (channel?.isTextBased()) {
+      const user = await client.users.fetch(alert.userId);
+      await channel.send({ content: alert.message.replace('{user}', `<@${user.id}>`) });
+    }
+  } catch (error) {
+    console.error(`Error executing online alert ${id}:`, error);
+  }
+}
+```
+
+```javascript
+// ./events/reactionAdd.js
+module.exports = {
+  name: 'reactionAdd',
+  async execute(reaction, user, client) {
+    if (user.bot) return;
+    
+    // Handle reaction roles
+    const guild = reaction.message.guild;
+    const reactionRoles = client.reactionRoles.get(guild.id);
+    
+    if (reactionRoles && reactionRoles.messageId === reaction.message.id) {
+      const role = guild.roles.cache.get(reactionRoles.roles[reaction.emoji.name]);
+      if (role) {
+        try {
+          const member = await guild.members.fetch(user.id);
+          await member.roles.add(role);
+        } catch (error) {
+          console.error('Error adding role:', error);
+        }
+      }
+    }
+  }
+};
+```
+
+```javascript
+// ./events/reactionRemove.js
+module.exports = {
+  name: 'reactionRemove',
+  async execute(reaction, user, client) {
+    if (user.bot) return;
+    
+    // Handle reaction roles removal
+    const guild = reaction.message.guild;
+    const reactionRoles = client.reactionRoles.get(guild.id);
+    
+    if (reactionRoles && reactionRoles.messageId === reaction.message.id) {
+      const role = guild.roles.cache.get(reactionRoles.roles[reaction.emoji.name]);
+      if (role) {
+        try {
+          const member = await guild.members.fetch(user.id);
+          await member.roles.remove(role);
+        } catch (error) {
+          console.error('Error removing role:', error);
+        }
+      }
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/moderation/warn.js
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('warn')
+    .setDescription('Warn a user')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to warn')
+        .setRequired(true))
+    .addStringOption(option => 
+      option.setName('reason')
+        .setDescription('Reason for warning')
+        .setRequired(false)),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.KickMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const user = interaction.options.getUser('user');
+    const reason = interaction.options.getString('reason') || 'No reason provided';
+    
+    try {
+      await interaction.guild.members.ban(user.id, { reason });
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('✅ User Warned')
+        .addFields(
+          { name: 'User', value: user.tag, inline: true },
+          { name: 'Moderator', value: interaction.user.tag, inline: true },
+          { name: 'Reason', value: reason }
+        )
+        .setTimestamp();
+      
+      await interaction.reply({ embeds: [embed] });
+      
+      // Send DM to warned user
+      try {
+        await user.send(`You have been warned in ${interaction.guild.name} for: ${reason}`);
+      } catch (e) {
+        // If DM fails, ignore
+      }
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: '❌ Failed to warn user. Make sure I have the proper permissions.', ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/moderation/kick.js
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('kick')
+    .setDescription('Kick a user')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to kick')
+        .setRequired(true))
+    .addStringOption(option => 
+      option.setName('reason')
+        .setDescription('Reason for kicking')
+        .setRequired(false)),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.KickMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const user = interaction.options.getUser('user');
+    const reason = interaction.options.getString('reason') || 'No reason provided';
+    
+    try {
+      await interaction.guild.members.kick(user.id, { reason });
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('✅ User Kicked')
+        .addFields(
+          { name: 'User', value: user.tag, inline: true },
+          { name: 'Moderator', value: interaction.user.tag, inline: true },
+          { name: 'Reason', value: reason }
+        )
+        .setTimestamp();
+      
+      await interaction.reply({ embeds: [embed] });
+      
+      // Send DM to kicked user
+      try {
+        await user.send(`You have been kicked from ${interaction.guild.name} for: ${reason}`);
+      } catch (e) {
+        // If DM fails, ignore
+      }
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: '❌ Failed to kick user. Make sure I have the proper permissions.', ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/moderation/ban.js
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('ban')
+    .setDescription('Ban a user')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to ban')
+        .setRequired(true))
+    .addIntegerOption(option => 
+      option.setName('days')
+        .setDescription('Number of days of messages to delete (0-7)')
+        .setRequired(false))
+    .addStringOption(option => 
+      option.setName('reason')
+        .setDescription('Reason for banning')
+        .setRequired(false)),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const user = interaction.options.getUser('user');
+    const days = interaction.options.getInteger('days') || 0;
+    const reason = interaction.options.getString('reason') || 'No reason provided';
+    
+    try {
+      await interaction.guild.members.ban(user.id, { days, reason });
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('✅ User Banned')
+        .addFields(
+          { name: 'User', value: user.tag, inline: true },
+          { name: 'Moderator', value: interaction.user.tag, inline: true },
+          { name: 'Days of messages deleted', value: days.toString(), inline: true },
+          { name: 'Reason', value: reason }
+        )
+        .setTimestamp();
+      
+      await interaction.reply({ embeds: [embed] });
+      
+      // Send DM to banned user
+      try {
+        await user.send(`You have been banned from ${interaction.guild.name} for: ${reason}`);
+      } catch (e) {
+        // If DM fails, ignore
+      }
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: '❌ Failed to ban user. Make sure I have the proper permissions.', ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/moderation/mute.js
+const { SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('mute')
+    .setDescription('Mute a user')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to mute')
+        .setRequired(true))
+    .addIntegerOption(option => 
+      option.setName('duration')
+        .setDescription('Duration in minutes (0 for permanent)')
+        .setRequired(false))
+    .addStringOption(option => 
+      option.setName('reason')
+        .setDescription('Reason for muting')
+        .setRequired(false)),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const user = interaction.options.getUser('user');
+    const duration = interaction.options.getInteger('duration') || 0;
+    const reason = interaction.options.getString('reason') || 'No reason provided';
+    
+    try {
+      const member = await interaction.guild.members.fetch(user.id);
+      
+      // Create muted role if it doesn't exist
+      let mutedRole = interaction.guild.roles.cache.find(role => role.name === 'Muted');
+      if (!mutedRole) {
+        mutedRole = await interaction.guild.roles.create({
+          name: 'Muted',
+          permissions: [],
+          reason: 'Creating muted role for mute command'
+        });
+        
+        // Set permissions for all text channels
+        interaction.guild.channels.cache.filter(ch => ch.isTextBased()).forEach(channel => {
+          channel.permissionOverwrites.edit(mutedRole, {
+            SendMessages: false,
+            AddReactions: false,
+            Speak: false,
+            Connect: false
+          });
+        });
+      }
+      
+      // Apply mute
+      if (duration > 0) {
+        await member.timeout(duration * 60000, reason);
+      } else {
+        await member.roles.add(mutedRole, reason);
+      }
+      
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('✅ User Muted')
+        .addFields(
+          { name: 'User', value: user.tag, inline: true },
+          { name: 'Moderator', value: interaction.user.tag, inline: true },
+          { name: 'Duration', value: duration > 0 ? `${duration} minutes` : 'Permanent', inline: true },
+          { name: 'Reason', value: reason }
+        )
+        .setTimestamp();
+      
+      await interaction.reply({ embeds: [embed] });
+      
+      // Send DM to muted user
+      try {
+        await user.send(`You have been muted in ${interaction.guild.name} for: ${reason}`);
+      } catch (e) {
+        // If DM fails, ignore
+      }
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: '❌ Failed to mute user. Make sure I have the proper permissions.', ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/moderation/unmute.js
+const { SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('unmute')
+    .setDescription('Unmute a user')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to unmute')
+        .setRequired(true))
+    .addStringOption(option => 
+      option.setName('reason')
+        .setDescription('Reason for unmuting')
+        .setRequired(false)),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const user = interaction.options.getUser('user');
+    const reason = interaction.options.getString('reason') || 'No reason provided';
+    
+    try {
+      const member = await interaction.guild.members.fetch(user.id);
+      
+      // Remove timeout if exists
+      if (member.communicationDisabledUntilTimestamp) {
+        await member.timeout(null, reason);
+      }
+      
+      // Remove muted role if exists
+      const mutedRole = interaction.guild.roles.cache.find(role => role.name === 'Muted');
+      if (mutedRole && member.roles.cache.has(mutedRole.id)) {
+        await member.roles.remove(mutedRole, reason);
+      }
+      
+      const embed = new EmbedBuilder()
+        .setColor('#00ff00')
+        .setTitle('✅ User Unmuted')
+        .addFields(
+          { name: 'User', value: user.tag, inline: true },
+          { name: 'Moderator', value: interaction.user.tag, inline: true },
+          { name: 'Reason', value: reason }
+        )
+        .setTimestamp();
+      
+      await interaction.reply({ embeds: [embed] });
+      
+      // Send DM to unmuted user
+      try {
+        await user.send(`You have been unmuted in ${interaction.guild.name}`);
+      } catch (e) {
+        // If DM fails, ignore
+      }
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: '❌ Failed to unmute user. Make sure I have the proper permissions.', ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/moderation/timeout.js
+const { SlashCommandBuilder, EmbedBuilder, PermissionsBitField } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('timeout')
+    .setDescription('Timeout a user')
+    .addUserOption(option => 
+      option.setName('user')
+        .setDescription('The user to timeout')
+        .setRequired(true))
+    .addIntegerOption(option => 
+      option.setName('duration')
+        .setDescription('Duration in minutes (1-40320)')
+        .setRequired(true))
+    .addStringOption(option => 
+      option.setName('reason')
+        .setDescription('Reason for timeout')
+        .setRequired(false)),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const user = interaction.options.getUser('user');
+    const duration = interaction.options.getInteger('duration');
+    const reason = interaction.options.getString('reason') || 'No reason provided';
+    
+    // Validate duration (1 minute to 28 days)
+    if (duration < 1 || duration > 40320) {
+      return interaction.reply({ content: '❌ Duration must be between 1 and 40320 minutes (28 days).', ephemeral: true });
+    }
+    
+    try {
+      const member = await interaction.guild.members.fetch(user.id);
+      
+      // Apply timeout
+      await member.timeout(duration * 60000, reason);
+      
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setTitle('✅ User Timed Out')
+        .addFields(
+          { name: 'User', value: user.tag, inline: true },
+          { name: 'Moderator', value: interaction.user.tag, inline: true },
+          { name: 'Duration', value: `${duration} minutes`, inline: true },
+          { name: 'Reason', value: reason }
+        )
+        .setTimestamp();
+      
+      await interaction.reply({ embeds: [embed] });
+      
+      // Send DM to timed out user
+      try {
+        await user.send(`You have been timed out in ${interaction.guild.name} for: ${reason}`);
+      } catch (e) {
+        // If DM fails, ignore
+      }
+    } catch (error) {
+      console.error(error);
+      await interaction.reply({ content: '❌ Failed to timeout user. Make sure I have the proper permissions.', ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/welcome/welcome.js
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('welcome')
+    .setDescription('Configure welcome settings')
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('set-channel')
+        .setDescription('Set the welcome channel')
+        .addChannelOption(option =>
+          option.setName('channel')
+            .setDescription('The channel to send welcome messages')
+            .setRequired(true)))
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('set-message')
+        .setDescription('Set the welcome message')
+        .addStringOption(option =>
+          option.setName('message')
+            .setDescription('The welcome message template')
+            .setRequired(true))),
+  async execute(interaction, client) {
+    // Check permissions
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ content: '❌ You do not have permission to use this command!', ephemeral: true });
+    }
+    
+    const subcommand = interaction.options.getSubcommand();
+    
+    if (subcommand === 'set-channel') {
+      const channel = interaction.options.getChannel('channel');
+      // Store in database or config
+      await interaction.reply({ content: `✅ Welcome channel set to ${channel}`, ephemeral: true });
+    } else if (subcommand === 'set-message') {
+      const message = interaction.options.getString('message');
+      // Store in database or config
+      await interaction.reply({ content: `✅ Welcome message set to: ${message}`, ephemeral: true });
+    }
+  }
+};
+```
+
+```javascript
+// ./commands/ai-chat/chat.js
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('chat')
+    .setDescription('Chat with AI')
+    .addStringOption(option => 
+      option.setName('message')
+        .setDescription('Your message to the AI')
+        .setRequired(true)),
+  async execute(interaction, client) {
+    const message = interaction.options.getString('message');
+    
+    // Simulate AI response (replace with actual AI API)
+    const responses = [
+      "I'm shahar Toueg, your friendly Discord assistant!",
+      "That's an interesting question. Let me think about it...",
+      "I'm still learning, but I'll do my best to help!",
+      "Thanks for chatting with me! How can I assist you today?",
+      "I'm designed to help with moderation, music, and more!"
+    ];
+    
+    const response = responses[Math.floor(Math.random() * responses.length)];
+    
+    const embed = new EmbedBuilder()
+      .setColor('#00bfff')
+      .setTitle('🤖 AI Response')
+      .addFields(
+        { name: 'You said:', value: message },
+        { name: 'AI says:', value: response }
+      )
+      .setTimestamp();
+    
+    await interaction.reply({ embeds: [embed] });
+  }
+};
+```
+
+```javascript
+// ./commands/logging/log.js
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+
+module.exports = {
+  data: new SlashCommandBuilder
